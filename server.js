@@ -24,7 +24,12 @@ const pool = new Pool({
     port: process.env.DB_PORT,
     database: process.env.DB_NAME,
     user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD
+    password: process.env.DB_PASSWORD,
+    // Neon requires TLS in production. Keep local PostgreSQL usable too.
+    ssl: process.env.DB_HOST && /neon\.tech$/i.test(process.env.DB_HOST)
+        ? { rejectUnauthorized: false }
+        : undefined,
+    connectionTimeoutMillis: 10000
 });
 
 // ============================================================
