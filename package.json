@@ -1,0 +1,15 @@
+{
+  "name": "discordprofile",
+  "version": "1.0.0",
+  "description": "Página personal con Discord OAuth y PostgreSQL",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "express-session": "^1.18.2",
+    "pg": "^8.16.3"
+  }
+}
