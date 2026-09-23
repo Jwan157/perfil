@@ -1,9 +1,11 @@
 const express = require("express");
 const session = require("express-session");
 const { Pool } = require("pg");
+const connectPgSimple = require("connect-pg-simple")(session);
 const path = require("path");
 const fs = require("fs");
 const fsp = require("fs/promises");
+const { issueSignedToken, presignUrl, head, del } = require("@vercel/blob");
 const crypto = require("crypto");
 require("dotenv").config();
 
@@ -11,6 +13,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const UPLOAD_DIR = path.join(__dirname, "private_uploads");
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB por archivo
+const IS_VERCEL = process.env.VERCEL === "1" || !!process.env.VERCEL_ENV;
 
 // ============================================================
 // CONFIGURACIÓN DE POSTGRESQL
@@ -34,22 +37,37 @@ app.set("trust proxy", 1);
 
 app.use(
     session({
+        store: new connectPgSimple({
+            pool,
+            createTableIfMissing: true
+        }),
         secret:
             process.env.SESSION_SECRET ||
             "clave-secreta-cambiar",
-
         resave: false,
-
         saveUninitialized: false,
-
         cookie: {
-            maxAge: 1000 * 60 * 60 * 24
+            maxAge: 1000 * 60 * 60 * 24,
+            secure: IS_VERCEL,
+            httpOnly: true,
+            sameSite: "lax"
         }
     })
 );
 
+// Garantiza que las tablas existan antes de procesar las rutas que usan PostgreSQL.
+app.use(async (req, res, next) => {
+    try {
+        await asegurarBaseDatos();
+        next();
+    } catch (error) {
+        console.error("Error inicializando PostgreSQL:", error.message);
+        next();
+    }
+});
+
 // Servir la carpeta public
-app.use(express.static("public"));
+app.use(express.static(path.join(__dirname, "public")));
 
 // ============================================================
 // PREPARAR BASE DE DATOS
@@ -84,6 +102,16 @@ async function prepararBaseDatos() {
                 tamano BIGINT NOT NULL DEFAULT 0,
                 fecha TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             );
+        `);
+
+        await pool.query(`
+            ALTER TABLE archivos
+            ADD COLUMN IF NOT EXISTS blob_pathname VARCHAR(500);
+        `);
+
+        await pool.query(`
+            ALTER TABLE archivos
+            ADD COLUMN IF NOT EXISTS blob_url TEXT;
         `);
 
         await pool.query(`
@@ -129,7 +157,9 @@ await pool.query(`
             ON visitas(fecha);
         `);
 
-        await fsp.mkdir(UPLOAD_DIR, { recursive: true });
+        if (!IS_VERCEL) {
+            await fsp.mkdir(UPLOAD_DIR, { recursive: true });
+        }
         console.log("Base de datos preparada.");
 
     } catch (error) {
@@ -898,6 +928,8 @@ app.get(
 
 // ============================================================
 // ARCHIVOS PRIVADOS — ARRASTRAR Y SOLTAR
+// Vercel: Vercel Blob privado + URLs firmadas
+// Local: almacenamiento local para seguir probando sin Blob
 // ============================================================
 
 function comprobarAccesoArchivos(req, res, next) {
@@ -921,6 +953,14 @@ function categoriaValida(categoria) {
     return permitidas.includes(categoria) ? categoria : "otros";
 }
 
+function extensionSegura(nombre) {
+    return path.extname(nombre).slice(0, 20).replace(/[^\w.]/g, "") || "";
+}
+
+function blobActivo() {
+    return IS_VERCEL;
+}
+
 app.get("/api/archivos", comprobarAccesoArchivos, async (req, res) => {
     try {
         const categoria = req.query.categoria ? categoriaValida(req.query.categoria) : null;
@@ -942,29 +982,123 @@ app.get("/api/archivos", comprobarAccesoArchivos, async (req, res) => {
     }
 });
 
+// Vercel Blob: el navegador sube directamente al Blob con una URL firmada.
+app.post("/api/archivos/upload-url", comprobarAccesoArchivos, async (req, res) => {
+    if (!blobActivo()) {
+        return res.status(400).json({ ok: false, modo: "local", mensaje: "El almacenamiento Blob se activa al desplegar en Vercel." });
+    }
+
+    try {
+        const nombreOriginal = limpiarNombreArchivo(req.body?.nombre);
+        const categoria = categoriaValida(req.body?.categoria);
+        const tipo = String(req.body?.tipo || "application/octet-stream").slice(0, 180);
+        const tamano = Number(req.body?.tamano || 0);
+
+        if (!tamano || tamano > MAX_FILE_SIZE) {
+            return res.status(413).json({ ok: false, mensaje: "El archivo debe pesar entre 1 B y 100 MB." });
+        }
+
+        const pathname = `archivos/${categoria}/${crypto.randomUUID()}${extensionSegura(nombreOriginal)}`;
+        const validUntil = Date.now() + 15 * 60 * 1000;
+
+        const token = await issueSignedToken({
+            pathname,
+            operations: ["put"],
+            validUntil,
+            allowedContentTypes: [tipo],
+            maximumSizeInBytes: MAX_FILE_SIZE
+        });
+
+        const { presignedUrl } = await presignUrl(token, {
+            pathname,
+            operation: "put",
+            validUntil,
+            allowedContentTypes: [tipo],
+            maximumSizeInBytes: MAX_FILE_SIZE,
+            access: "private"
+        });
+
+        res.json({
+            ok: true,
+            modo: "blob",
+            pathname,
+            presignedUrl,
+            nombre: nombreOriginal,
+            categoria,
+            tipo,
+            tamano
+        });
+    } catch (error) {
+        console.error("Error generando URL de Blob:", error);
+        res.status(500).json({ ok: false, mensaje: "No se pudo preparar la subida a Vercel Blob." });
+    }
+});
+
+// Confirma en PostgreSQL que el objeto realmente existe en Blob antes de guardar el registro.
+app.post("/api/archivos/finalize", comprobarAccesoArchivos, async (req, res) => {
+    if (!blobActivo()) {
+        return res.status(400).json({ ok: false, mensaje: "Este endpoint es para Vercel Blob." });
+    }
+
+    try {
+        const pathname = String(req.body?.pathname || "");
+        const nombre = limpiarNombreArchivo(req.body?.nombre);
+        const categoria = categoriaValida(req.body?.categoria);
+        const tipo = String(req.body?.tipo || "application/octet-stream").slice(0, 180);
+
+        if (!pathname.startsWith("archivos/") || pathname.length > 500) {
+            return res.status(400).json({ ok: false, mensaje: "Ruta de archivo no válida." });
+        }
+
+        const blob = await head(pathname, { access: "private" });
+        const tamano = Number(blob.size || 0);
+
+        if (!tamano || tamano > MAX_FILE_SIZE) {
+            return res.status(413).json({ ok: false, mensaje: "El archivo supera el límite permitido." });
+        }
+
+        const resultado = await pool.query(
+            `INSERT INTO archivos (nombre, nombre_guardado, categoria, tipo, tamano, blob_pathname, blob_url)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id, nombre, categoria, tipo, tamano, fecha`,
+            [nombre, pathname, categoria, typeSeguro(tipo, blob.contentType), tamano, pathname, blob.url]
+        );
+
+        res.status(201).json({ ok: true, archivo: resultado.rows[0] });
+    } catch (error) {
+        console.error("Error finalizando archivo Blob:", error);
+        res.status(500).json({ ok: false, mensaje: "El archivo se subió, pero no se pudo registrar en PostgreSQL." });
+    }
+});
+
+function typeSeguro(preferido, real) {
+    const valor = String(real || preferido || "application/octet-stream").slice(0, 180);
+    return valor;
+}
+
+// Ruta local de subida: se mantiene para trabajar en el PC sin Vercel.
 app.post(
     "/api/archivos/upload",
     comprobarAccesoArchivos,
     express.raw({ type: "*/*", limit: "100mb" }),
     async (req, res) => {
+        if (blobActivo()) {
+            return res.status(400).json({ ok: false, mensaje: "En Vercel usa /api/archivos/upload-url para subir directamente a Blob." });
+        }
         try {
             const nombreOriginal = limpiarNombreArchivo(decodeURIComponent(String(req.headers["x-file-name"] || "archivo")));
             const categoria = categoriaValida(req.headers["x-file-category"]);
             const tipo = String(req.headers["x-file-type"] || "application/octet-stream").slice(0, 180);
             const buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || "");
 
-            if (!buffer.length) {
-                return res.status(400).json({ ok: false, mensaje: "El archivo está vacío." });
-            }
+            if (!buffer.length) return res.status(400).json({ ok: false, mensaje: "El archivo está vacío." });
+            if (buffer.length > MAX_FILE_SIZE) return res.status(413).json({ ok: false, mensaje: "El archivo supera el límite de 100 MB." });
 
-            if (buffer.length > MAX_FILE_SIZE) {
-                return res.status(413).json({ ok: false, mensaje: "El archivo supera el límite de 100 MB." });
-            }
-
-            const extension = path.extname(nombreOriginal).slice(0, 15);
+            const extension = extensionSegura(nombreOriginal);
             const nombreGuardado = `${crypto.randomUUID()}${extension}`;
             const destino = path.join(UPLOAD_DIR, nombreGuardado);
 
+            await fsp.mkdir(UPLOAD_DIR, { recursive: true });
             await fsp.writeFile(destino, buffer, { flag: "wx" });
 
             const resultado = await pool.query(
@@ -976,7 +1110,7 @@ app.post(
 
             res.status(201).json({ ok: true, archivo: resultado.rows[0] });
         } catch (error) {
-            console.error("Error subiendo archivo:", error.message);
+            console.error("Error subiendo archivo local:", error.message);
             res.status(500).json({ ok: false, mensaje: "No se pudo guardar el archivo." });
         }
     }
@@ -985,21 +1119,31 @@ app.post(
 app.get("/api/archivos/:id/download", comprobarAccesoArchivos, async (req, res) => {
     try {
         const resultado = await pool.query(
-            `SELECT id, nombre, nombre_guardado, tipo FROM archivos WHERE id = $1`,
+            `SELECT id, nombre, nombre_guardado, tipo, blob_pathname FROM archivos WHERE id = $1`,
             [req.params.id]
         );
 
-        if (!resultado.rows.length) {
-            return res.status(404).send("Archivo no encontrado.");
-        }
+        if (!resultado.rows.length) return res.status(404).send("Archivo no encontrado.");
 
         const archivo = resultado.rows[0];
-        const ruta = path.join(UPLOAD_DIR, archivo.nombre_guardado);
 
-        if (!fs.existsSync(ruta)) {
-            return res.status(404).send("El archivo ya no existe en el almacenamiento.");
+        if (blobActivo()) {
+            const pathname = archivo.blob_pathname || archivo.nombre_guardado;
+            if (!pathname || !pathname.startsWith("archivos/")) return res.status(404).send("Archivo no disponible.");
+
+            const validUntil = Date.now() + 10 * 60 * 1000;
+            const token = await issueSignedToken({ pathname, operations: ["get"], validUntil });
+            const { presignedUrl } = await presignUrl(token, {
+                pathname,
+                operation: "get",
+                validUntil,
+                access: "private"
+            });
+            return res.redirect(302, presignedUrl);
         }
 
+        const ruta = path.join(UPLOAD_DIR, archivo.nombre_guardado);
+        if (!fs.existsSync(ruta)) return res.status(404).send("El archivo ya no existe en el almacenamiento local.");
         res.download(ruta, archivo.nombre, { maxAge: 0 });
     } catch (error) {
         console.error("Error descargando archivo:", error.message);
@@ -1010,25 +1154,25 @@ app.get("/api/archivos/:id/download", comprobarAccesoArchivos, async (req, res) 
 app.delete("/api/archivos/:id", comprobarAccesoArchivos, async (req, res) => {
     try {
         const resultado = await pool.query(
-            `SELECT nombre_guardado FROM archivos WHERE id = $1`,
+            `SELECT nombre_guardado, blob_pathname FROM archivos WHERE id = $1`,
             [req.params.id]
         );
 
-        if (!resultado.rows.length) {
-            return res.status(404).json({ ok: false, mensaje: "Archivo no encontrado." });
-        }
+        if (!resultado.rows.length) return res.status(404).json({ ok: false, mensaje: "Archivo no encontrado." });
 
-        const nombreGuardado = resultado.rows[0].nombre_guardado;
-        const ruta = path.join(UPLOAD_DIR, nombreGuardado);
+        const { nombre_guardado: nombreGuardado, blob_pathname: blobPathname } = resultado.rows[0];
+
+        if (blobActivo()) {
+            const pathname = blobPathname || nombreGuardado;
+            if (pathname && pathname.startsWith("archivos/")) {
+                await del(pathname, { access: "private" });
+            }
+        } else {
+            const ruta = path.join(UPLOAD_DIR, nombreGuardado);
+            try { await fsp.unlink(ruta); } catch (error) { if (error.code !== "ENOENT") throw error; }
+        }
 
         await pool.query(`DELETE FROM archivos WHERE id = $1`, [req.params.id]);
-
-        try {
-            await fsp.unlink(ruta);
-        } catch (error) {
-            if (error.code !== "ENOENT") throw error;
-        }
-
         res.json({ ok: true });
     } catch (error) {
         console.error("Error eliminando archivo:", error.message);
@@ -1037,39 +1181,29 @@ app.delete("/api/archivos/:id", comprobarAccesoArchivos, async (req, res) => {
 });
 
 // ============================================================
-// INICIAR SERVIDOR
+// INICIAR SERVIDOR / VERCEL
 // ============================================================
 
-async function iniciarServidor() {
-
-    await prepararBaseDatos();
-
-    app.listen(
-        PORT,
-        "0.0.0.0",
-        () => {
-
-            console.log(
-                "----------------------------------"
-            );
-
-            console.log(
-                "DiscordProfile iniciado"
-            );
-
-            console.log(
-                `http://jwanfps.local:${PORT}`
-            );
-
-            console.log(
-                "----------------------------------"
-            );
-        }
-    );
+let dbInitPromise;
+function asegurarBaseDatos() {
+    if (!dbInitPromise) dbInitPromise = prepararBaseDatos();
+    return dbInitPromise;
 }
 
-// ============================================================
-// EJECUTAR
-// ============================================================
+// En Vercel Express se exporta la app; Vercel gestiona el servidor HTTP.
+// En local seguimos usando node server.js normalmente.
+if (!IS_VERCEL) {
+    asegurarBaseDatos().then(() => {
+        app.listen(PORT, "0.0.0.0", () => {
+            console.log("----------------------------------");
+            console.log("DiscordProfile iniciado");
+            console.log(`http://localhost:${PORT}`);
+            console.log("----------------------------------");
+        });
+    });
+} else {
+    // Inicialización perezosa: no bloquea el arranque de la función.
+    asegurarBaseDatos().catch(error => console.error("Error inicializando BD en Vercel:", error));
+}
 
-iniciarServidor();
+module.exports = app;

@@ -3739,6 +3739,52 @@ claveVistas.addEventListener("keydown", function (event) {
   }
 
   function subirUno(file, categoria) {
+    // En Vercel el archivo va directamente a Vercel Blob con una URL firmada.
+    // Así evitamos pasar archivos grandes por la Function.
+    if (!['localhost','127.0.0.1'].includes(location.hostname) && !location.hostname.endsWith('.local')) {
+      return fetch('/api/archivos/upload-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nombre: file.name, categoria, tipo: file.type || 'application/octet-stream', tamano: file.size })
+      }).then(async r => {
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || !data.ok) throw new Error(data.mensaje || `HTTP ${r.status}`);
+
+        return new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('PUT', data.presignedUrl);
+          xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+          xhr.upload.onprogress = e => {
+            if (e.lengthComputable) progresoBar.style.width = `${(e.loaded / e.total) * 100}%`;
+          };
+          xhr.onload = async () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try {
+                const fin = await fetch('/api/archivos/finalize', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    pathname: data.pathname,
+                    nombre: data.nombre,
+                    categoria: data.categoria,
+                    tipo: data.tipo
+                  })
+                });
+                const finData = await fin.json().catch(() => ({}));
+                if (!fin.ok || !finData.ok) throw new Error(finData.mensaje || `HTTP ${fin.status}`);
+                resolve();
+              } catch (e) { reject(e); }
+            } else {
+              reject(new Error(xhr.responseText || `HTTP ${xhr.status}`));
+            }
+          };
+          xhr.onerror = () => reject(new Error('Error de red al subir a Vercel Blob'));
+          xhr.send(file);
+        });
+      });
+    }
+
+    // En local conserva el sistema original de almacenamiento en private_uploads/.
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/api/archivos/upload');
